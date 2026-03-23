@@ -1,0 +1,89 @@
+#!/bin/sh
+
+# 現在のブランチ名を取得
+branch=$(git rev-parse --abbrev-ref HEAD)
+
+# main, master, qaブランチではcommitできません。
+if [ "$branch" = "main" ] || [ "$branch" = "master" ] || [ "$branch" = "qa" ]; then
+  echo "❌ $branch ブランチではcommitできません。別のブランチを使用してください。"
+  exit 1
+fi
+
+# =======================================================
+# renv.lock チェック (ステージングされた内容を確認)
+# =======================================================
+echo "🔍 renv.lock をチェックしています..."
+
+# 1. renv.lock がステージングエリアに存在するか確認
+if ! git rev-parse --verify -q :renv.lock > /dev/null; then
+  # ファイルが存在しない場合はチェック対象外として正常終了
+  echo "ℹ️ renv.lock がステージングエリアに見つからないため、チェックをスキップします。"
+  exit 0
+fi
+
+LOCK_CONTENT=$(git show :renv.lock)
+
+# 2. 構造チェック ("R" ノードと "Repositories" ノード)
+if ! echo "$LOCK_CONTENT" | grep -q '"R":' || ! echo "$LOCK_CONTENT" | grep -q '"Repositories":'; then
+  echo "❌ renv.lock の形式が不正です ('R' または 'Repositories' ノードが見つかりません)。"
+  exit 1
+fi
+
+# 3. URL チェック (Repositories ノード内の URL が指定のドメインで始まっているか)
+ALLOWED_URL_PREFIX="https://aegisrspm."
+
+# awk を使用して Repositories ブロック内の URL のみを抽出・検証
+ERROR_MSG=$(echo "$LOCK_CONTENT" | awk -v prefix="$ALLOWED_URL_PREFIX" '
+BEGIN { in_repo = 0; exit_code = 0; }
+/"Repositories": \[/ { in_repo = 1; next; }
+in_repo && /\]/ { in_repo = 0; exit; } # リスト終了（簡易判定）
+in_repo && /"URL":/ {
+    # 行から URL 文字列を抽出: "URL": "VALUE", -> VALUE
+    line = $0;
+    sub(/.*"URL": "/, "", line); # キー部分削除
+    sub(/".*/, "", line);        # 末尾の " 以降を削除
+
+    #prefix = "https://aegisrspm.akaws-r-alb.onecloudlabo.com/";
+    #prefix = "https://aegisrspm.";
+    # prefix で始まっているか確認
+    if (substr(line, 1, length(prefix)) != prefix) {
+        print "❌ 不正なリポジトリ URL が検出されました: " line;
+        exit_code = 1;
+        exit 1;
+    }
+}
+END { if (exit_code == 1) exit 1; }
+')
+EXIT_CODE=$?
+
+# awk の終了コードがエラー(1)ならスクリプトを止める
+if [ $EXIT_CODE -ne 0 ]; then
+  echo "$ERROR_MSG"
+  echo "❌ URL は ${ALLOWED_URL_PREFIX}で始まる必要があります。"
+  exit 1
+fi
+
+# 4. Packages セクション内に Source が "Local" のパッケージが含まれていないか確認 (awk を使用)
+LOCAL_PKG_ERROR=$(echo "$LOCK_CONTENT" | awk '
+# "Packages" ブロックの開始を検出したら、フラグを立てる
+/"Packages": \{/ {
+  in_packages = 1;
+  next; # この行のチェックは不要なので次に進む
+}
+
+# フラグが立っている場合、"Source": "Local" を探す
+in_packages && /"Source"[[:space:]]*:[[:space:]]*"Local"/ {
+  print "❌ '\''Packages'\'' セクション内に Source が '\''Local'\'' のパッケージがあります。";
+  exit 1; # 見つけたら即座にエラーで終了
+}
+')
+EXIT_CODE=$?
+
+# awk がエラーで終了した場合
+if [ $EXIT_CODE -ne 0 ]; then
+  echo "$LOCAL_PKG_ERROR"
+  exit 1
+fi
+
+echo "✔ チェック完了"
+exit 0

@@ -1,0 +1,75 @@
+name: Check renv.lock
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  check-renv-lock:
+    name: check-renv-lock
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check renv.lock existence
+        run: |
+          if [ ! -f "renv.lock" ]; then
+            echo "::error::renv.lock ファイルがリポジトリのルートに見つかりません。"
+            exit 1
+          fi
+          echo "renv.lock が存在します。"
+
+      - name: Validate renv.lock content
+        # jq を使用して JSON をパースしてチェック
+        run: |
+          # 1. "R" ノードの存在確認
+          if ! jq -e '.R' renv.lock > /dev/null; then
+            echo "::error::renv.lock に 'R' ノードが見つかりません。"
+            exit 1
+          fi
+
+          # 2. "Repositories" ノードの存在確認
+          if ! jq -e '.R.Repositories' renv.lock > /dev/null; then
+            echo "::error::renv.lock の 'R' ノード下に 'Repositories' ノードが見つかりません。"
+            exit 1
+          fi
+
+          # 3. "Repositories" が空でないか確認（配列の長さが 0 より大きいか）
+          REPO_COUNT=$(jq '.R.Repositories | length' renv.lock)
+          if [ "$REPO_COUNT" -eq 0 ]; then
+            echo "::error::'Repositories' リストが空です。"
+            exit 1
+          fi
+
+          echo "基本構造チェック OK (Repositories count: $REPO_COUNT)"
+
+          # 4. URL のプレフィックスチェック
+          #    jq で URL のリストを抽出し、ループでチェック
+          ALLOWED_PREFIX="https://aegisrspm."
+
+          # jq -r で生文字列として取得
+          URLS=$(jq -r '.R.Repositories[].URL' renv.lock)
+
+          for URL in $URLS; do
+            if [[ "$URL" != "$ALLOWED_PREFIX"* ]]; then
+              echo "::error::不正なリポジトリ URL が検出されました: $URL"
+              echo "::error::URL は $ALLOWED_PREFIX で始まる必要があります。"
+              exit 1
+            fi
+            echo "URL チェック OK: $URL"
+          done
+
+          echo "全ての URL が有効です。"
+
+          # 5. Packages セクション内に Source が "Local" のパッケージが
+          #    含まれていないか確認（ローカルパッケージは許可しない）
+          LOCAL_PACKAGES=$(jq -r '[.Packages // {} | to_entries[] | select(.value.Source == "Local") | .key] | join(", ")' renv.lock)
+
+          if [ -n "$LOCAL_PACKAGES" ]; then
+            echo "::error::'Packages' セクション内に Source が 'Local' のパッケージがあります: $LOCAL_PACKAGES"
+            exit 1
+          fi
+
+          echo "Packages.Source チェック OK (Local なし)"

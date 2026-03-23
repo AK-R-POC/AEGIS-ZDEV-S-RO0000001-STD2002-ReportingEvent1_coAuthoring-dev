@@ -1,0 +1,42 @@
+name: Check PR Branch Direction
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+jobs:
+  check-pr-direction:
+    name: check-pr-direction
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: PR の送信元・送信先ブランチを検証
+        run: |
+          BASE="${{ github.event.pull_request.base.ref }}"
+          HEAD="${{ github.event.pull_request.head.ref }}"
+
+          echo "マージ先ブランチ（base）: $BASE"
+          echo "マージ元ブランチ（head）: $HEAD"
+
+          # ✅ 許可されている PR の方向:dev->qa
+          if [[ "$HEAD" == "dev" && "$BASE" == "qa" ]]; then
+            echo "✅ 許可された PR: dev → qa"
+            exit 0
+          fi
+
+          # ✅ 許可されている PR の方向:qa->main
+          if [[ "$HEAD" == "qa" && "$BASE" == "main" ]]; then
+            echo "✅ 許可された PR: qa → main"
+            exit 0
+          fi
+          
+          # ✅ 許可されている PR の方向：
+          #    feature ブランチ（dev / qa / main 以外）→ dev
+          if [[ "$BASE" == "dev" && "$HEAD" != "dev" && "$HEAD" != "qa" && "$HEAD" != "main" ]]; then
+            echo "✅ 許可された PR: ${HEAD} → dev (feature ブランチ → dev)"
+            exit 0
+          fi
+
+          # ❌ 許可されていない PR の方向（エラー表示）
+          echo "::error::無効な PR の方向です: ${HEAD} → ${BASE}。許可されているのは dev → qa , qa → main またはfeature(dev/qa/main以外) → devのみです。"
+          exit 1

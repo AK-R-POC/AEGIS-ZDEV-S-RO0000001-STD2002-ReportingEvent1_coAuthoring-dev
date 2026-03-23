@@ -1,0 +1,13 @@
+#!/bin/sh
+
+# 現在のブランチ名を取得
+branch=$(git rev-parse --abbrev-ref HEAD)
+
+# main, master, qaブランチではmerge commitできません。
+if [ "$branch" = "main" ] || [ "$branch" = "master" ] || [ "$branch" = "qa" ]; then
+  echo "❌ $branch ブランチではmerge commitが禁止されています。"
+  exit 1
+fi
+
+echo "✔ チェック完了"
+exit 0

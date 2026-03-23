@@ -1,0 +1,286 @@
+# ================================================
+# 機能概要
+# -----------------------------------------------
+# このワークフローはSelf-Hostedランナー上で、
+# リポジトリ名から環境情報を解析し、タグ作成時または手動実行時に
+# 資材を指定パスへデプロイします。
+#
+# 実行条件：
+# ・"Auto Tag Processing"ワークフローからの呼び出し時（自動実行）
+# ・workflow_dispatch（手動実行）
+#
+# 主な処理：
+# ・リポジトリ名からデプロイ先情報を抽出
+# ・テンプレートパス（vars）を変数で置換し配信先を決定
+# ・.github/.deployconfig.json の設定に基づき、配信先をクリーンアップ
+# ・.github/.deployconfig.json の設定に基づき、資材を配信先へ同期（rsync）
+# ・エラー時は即時中断、全処理ログはActionsで確認可能
+# ・最後にcheckout資材とログをクリーンアップ
+# ================================================
+
+name: Auto Deploy (Self-Hosted)
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+
+jobs:
+  analyze-repository-name:
+    runs-on: ubuntu-latest
+    outputs:
+      repo_type: ${{ steps.parse-name.outputs.repo_type }}
+      molecule_no: ${{ steps.parse-name.outputs.molecule_no }}
+      study_no: ${{ steps.parse-name.outputs.study_no }}
+      reporting_event: ${{ steps.parse-name.outputs.reporting_event }}
+      env_name: ${{ steps.parse-name.outputs.env_name }}
+    steps:
+      - name: Parse Repository Name
+        id: parse-name
+        run: |
+          # Get pure repository name (remove owner/)
+          REPO_NAME=$(echo "${{ github.repository }}" | awk -F '/' '{print $2}')
+          echo "Analyzing Repository Name: $REPO_NAME"
+
+          IFS='-' read -r -a parts <<< "$REPO_NAME"
+          PARTS_LEN=${#parts[@]}
+
+          # 3rd part (index 2) determines type S or M
+          # Example S: AEGIS-PRD-S-RO1234567-STD0001-ReportingEvent1-dev
+          # Example M: AEGIS-ZTEST-M-RO1234567-ReportingEvent2-dev
+
+          if [ "$PARTS_LEN" -lt 3 ]; then
+            echo "Error: Repository name must have at least 3 parts, got $PARTS_LEN."
+            exit 1
+          fi
+
+          TYPE="${parts[2]}"
+
+          if [ "$TYPE" == "S" ]; then
+            if [ "$PARTS_LEN" -lt 7 ]; then
+              echo "Error: Type S repository name must have at least 7 parts, got $PARTS_LEN."
+              exit 1
+            fi
+            echo "Detected Type: S (Study)"
+            MOLECULE_NO="${parts[3]}"
+            STUDY_NO="${parts[4]}"
+            EVENT_NAME="${parts[5]}"
+            ENV_NAME="${parts[6]}"
+
+            echo "repo_type=S" >> $GITHUB_OUTPUT            
+            echo "molecule_no=$MOLECULE_NO" >> $GITHUB_OUTPUT
+            echo "study_no=$STUDY_NO" >> $GITHUB_OUTPUT
+            echo "reporting_event=$EVENT_NAME" >> $GITHUB_OUTPUT
+            echo "env_name=$ENV_NAME" >> $GITHUB_OUTPUT
+
+          elif [ "$TYPE" == "M" ]; then
+            if [ "$PARTS_LEN" -lt 6 ]; then
+              echo "Error: Type M repository name must have at least 6 parts, got $PARTS_LEN."
+              exit 1
+            fi
+            echo "Detected Type: M (Molecule)"
+            MOLECULE_NO="${parts[3]}"
+            EVENT_NAME="${parts[4]}"
+            ENV_NAME="${parts[5]}"
+
+            echo "repo_type=M" >> $GITHUB_OUTPUT            
+            echo "molecule_no=$MOLECULE_NO" >> $GITHUB_OUTPUT
+            echo "study_no=" >> $GITHUB_OUTPUT
+            echo "reporting_event=$EVENT_NAME" >> $GITHUB_OUTPUT
+            echo "env_name=$ENV_NAME" >> $GITHUB_OUTPUT
+
+          else
+            echo "Error: Unknown repository name pattern. Type '$TYPE' is not S or M."
+            exit 1
+          fi
+
+  deploy:
+    needs: analyze-repository-name
+    # Self-Hosted ランナーを指定（ラベルは環境に合わせて調整してください）
+    runs-on:
+      [
+        self-hosted,
+        linux,
+        "${{ needs.analyze-repository-name.outputs.env_name }}"
+      ]
+
+    steps:
+      - name: Determine ref to checkout
+        id: set-ref
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "REF=${{ inputs.tag }}" >> $GITHUB_ENV
+            echo "Triggered by workflow_call. Using tag: ${{ inputs.tag }}"
+          else
+            echo "REF=${{ github.ref }}" >> $GITHUB_ENV
+            echo "Triggered by workflow_dispatch or default. Using ref: ${{ github.ref }}"
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: checkoutDir
+          ref: ${{ env.REF }}
+
+      - name: Show ref info
+        run: |
+          echo "Checked out ref: $REF"
+
+      - name: Prepare and Copy to Delivery Directory
+        env:
+          DELIVERY_DEST_S: ${{ vars.DELIVERY_DEST_S }}
+          DELIVERY_DEST_M: ${{ vars.DELIVERY_DEST_M }}
+          REPO_TYPE: ${{ needs.analyze-repository-name.outputs.repo_type }}
+          MOLECULE_NO: ${{ needs.analyze-repository-name.outputs.molecule_no }}
+          STUDY_NO: ${{ needs.analyze-repository-name.outputs.study_no }}
+          REPORTING_EVENT: ${{ needs.analyze-repository-name.outputs.reporting_event }}
+        run: |
+          set -e
+          LOG_FILE="deploy_report.log"
+          START_TIME=$(date +'%Y-%m-%d %H:%M:%S')
+          echo "========================================" > "$LOG_FILE"
+          echo "Deployment Report" >> "$LOG_FILE"
+          echo "Start Time: $START_TIME" >> "$LOG_FILE"
+
+          # 1. 配信先パスのテンプレートを選択
+          if [ "$REPO_TYPE" = "S" ]; then
+            DEST_TEMPLATE="$DELIVERY_DEST_S"
+          elif [ "$REPO_TYPE" = "M" ]; then
+            DEST_TEMPLATE="$DELIVERY_DEST_M"
+          else
+            echo "Error: Unknown repo_type: $REPO_TYPE" | tee -a "$LOG_FILE"
+            exit 1
+          fi
+
+          # DEST_TEMPLATEが空かどうかをチェック
+          if [ -z "$DEST_TEMPLATE" ]; then
+            echo "Error: 配信先テンプレート(DELIVERY_DEST_S/M)が未設定です。" | tee -a "$LOG_FILE"
+            exit 1
+          fi
+
+          # 2. テンプレート変数を置換
+          DEST_PATH="$DEST_TEMPLATE"
+          DEST_PATH="${DEST_PATH//<MoleculeNo>/$MOLECULE_NO}"
+          DEST_PATH="${DEST_PATH//<StudyNo>/$STUDY_NO}"
+          DEST_PATH="${DEST_PATH//<ReportingEventName>/$REPORTING_EVENT}"
+
+          # DEST_PATHが存在するかどうかをチェック
+          if [ ! -d "$DEST_PATH" ]; then
+            echo "Error: 配信先ディレクトリが存在しません: $DEST_PATH" | tee -a "$LOG_FILE"
+            exit 1
+          fi
+
+          echo "Target: $DEST_PATH" >> "$LOG_FILE"
+          echo "========================================" >> "$LOG_FILE"
+
+          # 3. .deployconfig.jsonから除外リストを読み込む
+          CONFIG_FILE="checkoutDir/.github/.deployconfig.json"
+
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Error: 設定ファイルが見つかりません: $CONFIG_FILE" | tee -a "$LOG_FILE"
+            exit 1
+          fi
+
+          # jqがインストールされているか確認
+          if ! command -v jq &> /dev/null; then
+            echo "Error: jq is not installed. Please install jq on the runner." | tee -a "$LOG_FILE"
+            exit 1
+          fi
+
+          # exclude_on_deleteリストを読み込む (ファイルとディレクトリを別々に保持)
+          readarray -t DELETE_EXCLUDE_FILES < <(jq -r '.exclude_on_delete.files[]' "$CONFIG_FILE")
+          readarray -t DELETE_EXCLUDE_DIRS < <(jq -r '.exclude_on_delete.dirs[]' "$CONFIG_FILE")
+
+          # exclude_on_copyリストを読み込む (ファイルとディレクトリを別々に保持)
+          readarray -t COPY_EXCLUDE_FILES < <(jq -r '.exclude_on_copy.files[]' "$CONFIG_FILE")
+          readarray -t COPY_EXCLUDE_DIRS < <(jq -r '.exclude_on_copy.dirs[]' "$CONFIG_FILE")
+
+          echo "Deletion Exclusions (Files): ${DELETE_EXCLUDE_FILES[@]}" | tee -a "$LOG_FILE"
+          echo "Deletion Exclusions (Dirs): ${DELETE_EXCLUDE_DIRS[@]}" | tee -a "$LOG_FILE"
+          echo "Copy Exclusions (Files): ${COPY_EXCLUDE_FILES[@]}" | tee -a "$LOG_FILE"
+          echo "Copy Exclusions (Dirs): ${COPY_EXCLUDE_DIRS[@]}" | tee -a "$LOG_FILE"
+
+          # 4. 配信先ディレクトリをクリーンアップする
+          echo "Cleaning destination directory: $DEST_PATH" | tee -a "$LOG_FILE"
+          # 隠しファイル・ディレクトリ（先頭が.）も含めて全てを対象とする
+          for item in "$DEST_PATH"/.* "$DEST_PATH"/*; do
+            # グロブが展開されなかった場合はスキップ
+            if [ ! -e "$item" ]; then
+              continue
+            fi
+            item_name=$(basename "$item")
+            # . と .. はスキップ
+            if [ "$item_name" = "." ] || [ "$item_name" = ".." ]; then
+              continue
+            fi
+            should_exclude=false
+
+            # アイテムがディレクトリの場合
+            if [ -d "$item" ]; then
+              for exclude_dir in "${DELETE_EXCLUDE_DIRS[@]}"; do
+                if [[ "$item_name" == "$exclude_dir" ]]; then
+                  should_exclude=true
+                  break
+                fi
+              done
+            # アイテムがファイルの場合
+            elif [ -f "$item" ]; then
+              for exclude_file in "${DELETE_EXCLUDE_FILES[@]}"; do
+                if [[ "$item_name" == "$exclude_file" ]]; then
+                  should_exclude=true
+                  break
+                fi
+              done
+            fi
+
+            if [[ "$should_exclude" == "false" ]];
+            then
+              echo "Deleting $item" >> "$LOG_FILE"
+              rm -rf "$item"
+            else
+              echo "Skipping deletion of $item" >> "$LOG_FILE"
+            fi
+          done
+
+          # 5. checkoutDirからDEST_PATHへファイルをコピーする
+          echo "Copying files from checkoutDir to $DEST_PATH" | tee -a "$LOG_FILE"
+          rsync_exclude_opts=()
+          for exclude in "${COPY_EXCLUDE_FILES[@]}"; do
+            rsync_exclude_opts+=(--exclude "$exclude")
+          done
+          for exclude in "${COPY_EXCLUDE_DIRS[@]}"; do
+            # ディレクトリの除外には末尾にスラッシュを追加して、同名のファイルを誤って除外しないようにする
+            rsync_exclude_opts+=(--exclude "$exclude/")
+          done
+
+          # rsyncの詳細な進捗はログファイルのみに出力する
+          rsync -av --progress "${rsync_exclude_opts[@]}" checkoutDir/ "$DEST_PATH/" >> "$LOG_FILE" 2>&1
+          if [ $? -ne 0 ]; then
+            echo "Error: Failed to copy files with rsync." | tee -a "$LOG_FILE"
+            exit 1
+          fi
+          echo "Copied files to $DEST_PATH." >> "$LOG_FILE"
+
+          END_TIME=$(date +'%Y-%m-%d %H:%M:%S')
+          echo "End Time: $END_TIME" >> "$LOG_FILE"
+          echo "========================================" >> "$LOG_FILE"
+          echo "Deployment completed successfully." | tee -a "$LOG_FILE"
+          echo " "
+          echo "▼▼▼▼▼▼▼▼▼▼ ログの詳細内容 ▼▼▼▼▼▼▼▼▼▼"
+          cat "$LOG_FILE"
+          echo "▲▲▲▲▲▲▲▲▲▲ ログの詳細内容 ▲▲▲▲▲▲▲▲▲▲"
+          echo " "
+
+          # 6. checkoutDirのクリーンアップ
+          echo "Cleaning up checkoutDir..."
+          rm -rf checkoutDir
+
+          # 7. ログファイルの削除
+          rm "$LOG_FILE"
