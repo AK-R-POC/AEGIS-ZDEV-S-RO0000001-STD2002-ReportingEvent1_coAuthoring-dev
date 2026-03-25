@@ -312,6 +312,7 @@
       "NeedsCompilation": "no",
       "Repository": "CRAN",
       "Encoding": "UTF-8"
+    },
     "lifecycle": {
       "Package": "lifecycle",
       "Version": "1.0.4",
